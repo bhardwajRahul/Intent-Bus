@@ -137,6 +137,7 @@ Intent Bus assumes:
 - Infinite retry loops (configurable max attempts)
 - Cross-tenant access (API key + namespace isolation)
 - Basic denial-of-service abuse (rate limits and payload caps)
+- Log Injection and SIEM spoofing (strict X-Request-ID regex validation)
 
 ### Not Mitigated
 
@@ -226,7 +227,7 @@ The following limits are enforced to protect the single-file SQLite architecture
 | --- | --- |
 | Payload Size | 8KB maximum |
 | Rate Limit | 60 requests / minute (Enforced per API key) |
-| Open Intent Cap | 100 open intents per publisher key |
+| Open Intent Cap | 2000 open intents per publisher key |
 
 *Note: Admin keys globally bypass rate limits and open-intent caps across all endpoints.*
 

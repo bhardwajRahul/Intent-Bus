@@ -81,8 +81,7 @@ def safe_execute(command_args: List[str], timeout: int = DEFAULT_TIMEOUT):
         raise ValueError("execution failed")
 
 
-
-def handle_sys_command(payload):
+def handle_sys_command(payload, timeout_sec):
     """
     Handler for the intent bus.
 
@@ -98,7 +97,8 @@ def handle_sys_command(payload):
 
     logger.info("Executing command: %r", command)
 
-    output = safe_execute(command)
+    # Pass the timeout down to the execution wrapper
+    output = safe_execute(command, timeout=timeout_sec)
 
     logger.info("SUCCESS | command=%r", command)
 
@@ -107,6 +107,7 @@ def handle_sys_command(payload):
         "result": output,
         "result_type": "text"
     }
+
 
 
 
@@ -163,7 +164,7 @@ def main():
         runtime.listen(
             goal=args.goal,
             namespace=args.namespace,
-            handler=handle_sys_command,
+            handler=lambda p: handle_sys_command(p, args.timeout),
         )
 
     except KeyboardInterrupt:

@@ -9,9 +9,10 @@ import hmac
 import random
 import re
 import threading
+import uuid
 from urllib.parse import urlencode, parse_qsl, quote
 
-from flask import Flask, request, jsonify, g, Response, render_template_string
+from flask import Flask, request, jsonify, g, Response, render_template_string, has_request_context
 
 try:
     from werkzeug.middleware.proxy_fix import ProxyFix
@@ -25,12 +26,59 @@ except ImportError:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# --- Structured JSON Logging Setup ---
+class JSONFormatter(logging.Formatter):
+    ALLOWED_EXTRA = {
+        "status_code", "duration_ms", "intent_id", "worker_id", "remote_addr",
+        "expired_open_deleted", "expired_claims_requeued", "expired_claims_dead",
+        "fulfilled_deleted", "dead_deleted", "dead_letters_deleted", "store_deleted",
+        "rate_limits_deleted", "idempotency_deleted", "nonces_deleted"
+    }
+
+    def format(self, record):
+        try:
+            log_record = {
+                "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(record.created)),
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "module": record.module
+            }
+
+            if has_request_context():
+                log_record["endpoint"] = request.path
+                log_record["method"] = request.method
+                log_record["request_id"] = getattr(g, "request_id", "unknown")
+                log_record["remote_addr"] = get_real_ip()
+
+            if record.exc_info:
+                log_record["exception"] = self.formatException(record.exc_info)
+                
+            for key in self.ALLOWED_EXTRA:
+                if key in record.__dict__:
+                    log_record[key] = record.__dict__[key]
+                    
+            return json.dumps(log_record, default=str)
+        except Exception as e:
+            return json.dumps({
+                "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                "level": "ERROR",
+                "message": "Logging failure",
+                "logger_error": str(e)
+            })
+
+app.logger.setLevel(logging.INFO)
+app.logger.handlers.clear()
+
+json_handler = logging.StreamHandler()
+json_handler.setFormatter(JSONFormatter())
+app.logger.addHandler(json_handler)
+app.logger.propagate = False
+# -------------------------------------
 
 TRUST_PROXY = os.environ.get("BUS_TRUST_PROXY", "false").lower() == "true"
 if TRUST_PROXY and ProxyFix is not None:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
-    logging.info("ProxyFix enabled. Trusting upstream proxy headers.")
+    app.logger.info("ProxyFix enabled. Trusting upstream proxy headers.")
 
 if sqlite3.sqlite_version_info < (3, 35, 0):
     raise RuntimeError("SQLite 3.35.0+ required for RETURNING clauses.")
@@ -77,9 +125,12 @@ DEAD_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 MAX_PAYLOAD = 8 * 1024
 MAX_TTL = 86400
-MAX_OPEN_INTENTS_PER_KEY = 100
+MAX_OPEN_INTENTS_PER_KEY = 2000
+
+CLEANUP_ERROR_COOLDOWN_SECONDS = 60
 
 last_cleanup_time = time.time()
+last_cleanup_error_time = 0
 cleanup_lock = threading.Lock()
 
 # =========================================================
@@ -148,7 +199,6 @@ def admin_auth_ok():
     if token:
         if ADMIN_SECRET:
             return hmac.compare_digest(token, ADMIN_SECRET)
-
         return False
 
     auth = request.authorization
@@ -160,7 +210,6 @@ def admin_auth_ok():
         )
 
     return False
-
 
 def require_admin():
     if admin_auth_ok():
@@ -182,23 +231,34 @@ def metrics_auth_ok():
     return admin_auth_ok()
 
 def maybe_cleanup():
-    global last_cleanup_time
+    global last_cleanup_time, last_cleanup_error_time
 
     if request.path == "/admin/cleanup":
         return
 
     t = now()
+
     if t - last_cleanup_time < CLEANUP_INTERVAL_SECONDS:
+        return
+
+    if t - last_cleanup_error_time < CLEANUP_ERROR_COOLDOWN_SECONDS:
         return
 
     if not cleanup_lock.acquire(blocking=False):
         return
 
     try:
-        if t - last_cleanup_time < CLEANUP_INTERVAL_SECONDS:
+        # Double check inside lock
+        if now() - last_cleanup_time < CLEANUP_INTERVAL_SECONDS:
             return
-        last_cleanup_time = t
-        run_cleanup_once()
+
+        success, _ = run_cleanup_once()
+
+        if success:
+            last_cleanup_time = now()
+            last_cleanup_error_time = 0
+        else:
+            last_cleanup_error_time = now()
     finally:
         cleanup_lock.release()
 
@@ -229,13 +289,8 @@ def close_db(e):
 
 def ensure_columns(db, table, columns):
     allowed_tables = {
-        "store",
-        "intents",
-        "tester_keys",
-        "rate_limits",
-        "idempotency_keys",
-        "request_nonces",
-        "dead_letters",
+        "store", "intents", "tester_keys", "rate_limits", 
+        "idempotency_keys", "request_nonces", "dead_letters"
     }
     if table not in allowed_tables:
         raise ValueError(f"Security Exception: Untrusted table name '{table}'")
@@ -600,22 +655,28 @@ def run_cleanup_once():
         stats["dead_letters_deleted"] = cur.rowcount
 
         db.commit()
+        
+        # Emit cleanup telemetry
+        app.logger.info("cleanup_complete", extra=stats)
+        return True, stats
 
     except sqlite3.OperationalError as e:
         if not is_busy_or_locked(e):
-            logging.error(f"Cleanup failed (OperationalError): {e}")
+            app.logger.error(f"Cleanup failed (OperationalError): {e}")
         if db:
             try:
                 db.rollback()
             except Exception:
                 pass
+        return False, stats
     except Exception as e:
-        logging.error(f"Cleanup failed: {e}")
+        app.logger.error(f"Cleanup failed: {e}")
         if db:
             try:
                 db.rollback()
             except Exception:
                 pass
+        return False, stats
     finally:
         if db:
             try:
@@ -623,14 +684,22 @@ def run_cleanup_once():
             except Exception:
                 pass
 
-    return stats
-
 # =========================================================
 # REQUEST LIFECYCLE
 # =========================================================
 
 @app.before_request
 def security():
+    # Defensive trace ID sanitization
+    if getattr(g, "request_id", None) is None:
+        req_id = request.headers.get("X-Request-ID", "")
+        if re.match(r"^[a-zA-Z0-9_.:-]{1,128}$", req_id):
+            g.request_id = req_id
+        else:
+            g.request_id = uuid.uuid4().hex
+            
+    g.request_start = time.perf_counter()
+
     if request.path in ("/", "/health"):
         return
 
@@ -699,13 +768,24 @@ def security():
             return api_error("internal_error", "An internal error occurred.", 500)
 
 @app.after_request
-def headers(r):
-    r.headers["X-Frame-Options"] = "DENY"
-    r.headers["X-Content-Type-Options"] = "nosniff"
-    r.headers["Referrer-Policy"] = "no-referrer"
-    r.headers["Cache-Control"] = "no-store"
-    r.headers["X-Intent-Version"] = "7.6"
-    return r
+def log_response(response):
+    start_time = getattr(g, "request_start", None)
+    duration_ms = round((time.perf_counter() - start_time) * 1000, 2) if start_time else 0.0
+
+    app.logger.info(
+        "request_complete",
+        extra={
+            "status_code": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
+    
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Intent-Version"] = "7.6"
+    return response
 
 # =========================================================
 # ROOT / HEALTH
@@ -1028,7 +1108,7 @@ def create_intent():
 
         if g.role != "admin":
             open_count = db.execute(
-                "SELECT COUNT(1) FROM intents WHERE publisher=? AND status='open'",
+                "SELECT COUNT(1) FROM intents WHERE publisher=? AND status IN ('open', 'claimed')",
                 (g.api_key,),
             ).fetchone()[0]
 
@@ -1037,7 +1117,7 @@ def create_intent():
                 return api_error(
                     "limit_exceeded",
                     f"Maximum of {MAX_OPEN_INTENTS_PER_KEY} open intents reached.",
-                429
+                    429,
                 )
 
         db.execute("""
@@ -1282,7 +1362,8 @@ def fail(iid):
             SELECT id, namespace, goal, payload, publisher, visibility,
                    claim_attempts, max_attempts, backoff_base
             FROM intents
-            WHERE id = ? AND claimed_by = ? AND status = 'claimed'
+            WHERE id = ?
+              AND claimed_by = ? AND status = 'claimed'
         """, (iid, g.api_key)).fetchone()
 
         if not row:
@@ -1378,7 +1459,8 @@ def fulfill(iid):
         row = db.execute("""
             SELECT id
             FROM intents
-            WHERE id = ? AND claimed_by = ? AND status = 'claimed'
+            WHERE id = ?
+              AND claimed_by = ? AND status = 'claimed'
         """, (iid, g.api_key)).fetchone()
 
         if not row:
@@ -1626,11 +1708,16 @@ def admin_cleanup():
     if not cleanup_lock.acquire(blocking=False):
         return api_error("busy", "Cleanup already running.", 503)
 
-    global last_cleanup_time
+    global last_cleanup_time, last_cleanup_error_time
     try:
-        last_cleanup_time = now()
-        stats = run_cleanup_once()
-        return jsonify(stats), 200
+        success, stats = run_cleanup_once()
+        if success:
+            last_cleanup_time = now()
+            last_cleanup_error_time = 0
+            return jsonify(stats), 200
+        else:
+            last_cleanup_error_time = now()
+            return api_error("cleanup_failed", "Cleanup encountered an error.", 500)
     finally:
         cleanup_lock.release()
 

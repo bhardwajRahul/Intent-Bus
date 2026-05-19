@@ -1,6 +1,8 @@
 #!/bin/bash
+set -uo pipefail
 
-#Intent Bus | Standard Auth Logging Worker
+# Intent Bus | Standard Auth Logging Worker v7.6
+# Writes structured logs to a local file safely
 
 API_KEY_FILE="$HOME/.apikey"
 BASE_URL="https://dsecurity.pythonanywhere.com"
@@ -32,7 +34,8 @@ if [ -L "$API_KEY_FILE" ]; then
   exit 1
 fi
 
-if [ "$(stat -c %u "$API_KEY_FILE")" != "$(id -u)" ]; then
+# POSIX compliant ownership check (No stat -c)
+if [ "$(ls -nd "$API_KEY_FILE" | awk '{print $3}')" != "$(id -u)" ]; then
   echo "[!] API key file not owned by current user"
   exit 1
 fi
@@ -44,6 +47,7 @@ API_KEY=$(cat "$API_KEY_FILE")
 install -m 600 /dev/null "$LOG_FILE" 2>/dev/null || touch "$LOG_FILE"
 chmod 600 "$LOG_FILE" || { echo "[!] Cannot secure log file permissions"; exit 1; }
 
+# --- Helpers ---
 report_status() {
   local endpoint="$1" id="$2" payload="$3"
   local attempt=0 max=3 delay=2
@@ -62,13 +66,24 @@ report_status() {
   return 1
 }
 
+# Safely parse Retry-After to prevent Bash crash
+parse_retry_after() {
+    local retry="${1:-}"
+    if [[ "$retry" =~ ^[0-9]+$ ]]; then
+        echo "$retry"
+    else
+        echo "$SLEEP_TIME"
+    fi
+}
+
 echo "Intent Bus Logging Worker v7.6 started"
 echo "Logging to: $LOG_FILE"
 
 trap "echo 'Shutdown'; exit 0" INT TERM
 
+# --- Main Loop ---
 while true; do
-  RESPONSE=$(curl -sS --max-time 10 --connect-timeout 5 \
+  CLAIM_RESPONSE=$(curl -sS --max-time 15 --connect-timeout 5 \
     -D - \
     -w "\n__HTTP_CODE__:%{http_code}" \
     -X POST \
@@ -77,16 +92,14 @@ while true; do
     -H "X-Worker-ID: $WORKER_ID" \
     -H "X-Worker-Capabilities: $CAPABILITIES")
 
-  STATUS=$(printf "%s" "$RESPONSE" | tr -d '\r' | grep "__HTTP_CODE__:" | cut -d: -f2)
-  RAW=$(printf "%s" "$RESPONSE" | sed '/__HTTP_CODE__/d')
-
-  # --- Retry-After (robust parsing) ---
-  RETRY_AFTER=$(printf "%s" "$RAW" \
-    | awk -F': *' 'tolower($1) ~ /retry-after/ {gsub(/[^0-9]/,"",$2); print $2}' \
-    | head -n1)
+  STATUS=$(printf "%s" "$CLAIM_RESPONSE" | grep "__HTTP_CODE__:" | cut -d: -f2 | tr -d '\r')
+  RAW=$(printf "%s" "$CLAIM_RESPONSE" | sed '/__HTTP_CODE__/d')
 
   if [ "$STATUS" = "204" ]; then
-    sleep "${RETRY_AFTER:-$SLEEP_TIME}"
+    # Safely extract Retry-After from HTTP headers using awk
+    RETRY_AFTER=$(printf "%s" "$RAW" | awk -F': *' 'tolower($1) ~ /retry-after/ {gsub(/[^0-9]/,"",$2); print $2}' | head -n1)
+    RETRY_AFTER=$(parse_retry_after "$RETRY_AFTER")
+    sleep "$RETRY_AFTER"
     continue
   fi
 
@@ -101,10 +114,10 @@ while true; do
   # --- Extract JSON safely (Production Hardened) ---
   BODY=$(printf "%s" "$RAW" | awk 'BEGIN{found=0} /^[[:space:]]*\{/{found=1} found' | tr -d '\r')
 
-  [ -z "$BODY" ] && { 
+  [ -z "$BODY" ] && {
     echo "[!] Empty response body"
     sleep "$ERROR_BACKOFF"
-    continue 
+    continue
   }
 
   echo "$BODY" | jq -e . >/dev/null 2>&1 || {
@@ -125,6 +138,7 @@ while true; do
   TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
   LOG_LINE="[$TIMESTAMP] ID: $ID | DATA: $PAYLOAD"
 
+  # Write to local log file and fulfill
   if printf "%s\n" "$LOG_LINE" >> "$LOG_FILE"; then
     report_status "fulfill" "$ID" '{"result":"logged","result_type":"text"}'
     echo "[$(date +%T)] Logged job $ID"

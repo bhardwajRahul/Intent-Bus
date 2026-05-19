@@ -56,7 +56,7 @@ if [[ -L "$API_KEY_FILE" ]]; then
   exit 1
 fi
 
-if [[ "$(stat -c %u "$API_KEY_FILE")" != "$(id -u)" ]]; then
+if [[ "$(ls -nd "$API_KEY_FILE" | awk "{print \$3}")" != "$(id -u)" ]]; then
   echo "[!] API key file not owned by current user"
   exit 1
 fi

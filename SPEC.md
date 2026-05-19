@@ -679,7 +679,7 @@ The protocol does NOT guarantee:
 - Replay attacks are mitigated by Strict Auth (nonce + timestamp window)
 - Rate limiting: 60 requests/minute per tester key
 - Request body size limit: 8KB total per request
-- Open intent cap: 100 open intents per tester key (the main `BUS_SECRET` key is exempt)
+- Open intent cap: 2000 open intents per tester key (the main `BUS_SECRET` key is exempt)
 - Dead letters are retained for 7 days
 - Fulfilled intents are retained for 7 days
 
@@ -690,6 +690,7 @@ The protocol does NOT guarantee:
 - SQLite WAL mode is required; `journal_mode` must be set to `WAL`
 - Atomic claiming MUST use `BEGIN IMMEDIATE` with `UPDATE ... RETURNING`
 - Cleanup is lazy: triggered by request traffic, not a background thread
+- If cleanup fails (e.g., database lock), the server enforces a 60-second backoff before retrying to prevent thrashing
 - Multiple gunicorn workers will cause SQLite write contention; use `--workers 1 --threads N`
 
 ---

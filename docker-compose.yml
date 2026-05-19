@@ -7,11 +7,10 @@ services:
       - "8080:8080"
 
     environment:
-      # --- Required ---
-      - BUS_SECRET=change_this_to_a_secure_key
-
-      # --- Admin & Dashboard ---
-      - DASHBOARD_PASSWORD=change_this_to_a_secure_password
+      # --- REQUIRED ---
+      - BUS_SECRET=${BUS_SECRET:?BUS_SECRET must be set in .env}
+      # --- ADMIN ---
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD:?DASHBOARD_PASSWORD must be set in .env}
       # - BUS_ADMIN_SECRET=separate_admin_secret_here
       # - BUS_METRICS_TOKEN=prometheus_bearer_token
 

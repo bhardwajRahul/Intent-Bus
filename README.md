@@ -321,6 +321,7 @@ A job with `target_worker` and `required_capability` must satisfy both condition
 - **Rate Limiting** — 60 req/min per API key
 - **Ephemeral KV Store** — `/set` and `/get` with configurable TTL
 - **Lazy Cleanup** — triggered by traffic, no background thread required
+- **Structured Observability** — Whitelist-filtered JSON logging, `duration_ms` tracking, and `X-Request-ID` tracing
 - **HMAC Signing** — optional replay-protected auth, handled by v2.0 SDK
 - **Admin Dashboard** — live queue stats and management at `/admin/dashboard`
 - **Prometheus Metrics** — `/metrics` with intent counts by status and namespace
