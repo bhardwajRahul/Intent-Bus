@@ -1,7 +1,6 @@
 import os
 import tempfile
 import pytest
-import json
 import hmac
 import hashlib
 import time
@@ -161,6 +160,7 @@ def test_cryptographic_signatures(client):
 
     canonical_path = "/intent"
 
+    # Construct the canonical message for signing: METHOD\nPATH\nTS\nNONCE\nBODY
     msg = (
         f"POST\n{canonical_path}\n{timestamp}\n{nonce}\n".encode()
         + body
@@ -189,7 +189,7 @@ def test_cryptographic_signatures(client):
 
     assert res.status_code == 201
 
-    # Replay attack
+    # Replay attack: Same headers and body should be rejected
     res_replay = client.post(
         "/intent",
         headers=headers,
@@ -200,7 +200,7 @@ def test_cryptographic_signatures(client):
     assert res_replay.status_code == 403
     assert "Replay detected" in res_replay.json["error"]["message"]
 
-    # Forged signature
+    # Forged signature: Change nonce but keep old signature
     headers["X-Nonce"] = "unique-nonce-002"
     headers["X-Signature"] = "deadbeef1234567890badsignature"
 

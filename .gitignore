@@ -1,20 +1,15 @@
 # =========================
-# Python
+# Python specific ignored files
 # =========================
+# Compiled Python bytecode cache directory
 __pycache__/
+# Compiled Python bytecode files
 *.py[cod]
+# Jython compiled class files
 *$py.class
 
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-.eggs/
-*.egg
-*.dist
-
 # =========================
-# Virtual Environments
+# Ignored Virtual Environment directories
 # =========================
 .env
 .env.*
@@ -25,7 +20,7 @@ venv/
 ENV/
 
 # =========================
-# IDE / Editor
+# Ignored IDE and Editor specific files
 # =========================
 .vscode/
 .idea/
@@ -33,36 +28,30 @@ ENV/
 *.swo
 
 # =========================
-# OS Files
+# Ignored OS generated files
 # =========================
 .DS_Store
 Thumbs.db
 
 # =========================
-# Logs
+# Ignored log files
 # =========================
 *.log
 bus_logs.txt
 
 # =========================
-# Intent Bus Runtime Data
-# =========================
+# Ignored Intent Bus Runtime Data (SQLite files)
+# ===============================================
 infrastructure.db
 infrastructure.db-wal
 infrastructure.db-shm
 *-wal
 *-shm
 
-# Avoid blanket DB ignores (safer for tests)
-# *.db
-# *.sqlite
-# *.sqlite3
-
 # =========================
-# Secrets (CRITICAL)
-# =========================
+# Ignored Secrets and sensitive files
+# ===============================================
 .apikey
-.env.*
 *.pem
 *.key
 *.crt
@@ -71,8 +60,8 @@ infrastructure.db-shm
 .envrc
 
 # =========================
-# Testing / Coverage
-# =========================
+# Ignored Testing and Coverage related files
+# =========================================
 .coverage
 htmlcov/
 .pytest_cache/
@@ -81,12 +70,8 @@ htmlcov/
 .tox/
 
 # =========================
-# Node (future-proofing)
-# =========================
-node_modules/
-
-# =========================
-# Misc
+# Miscellaneous ignored files
 # =========================
 *.tmp
 *.bak
+.aider*

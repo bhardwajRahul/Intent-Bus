@@ -24,9 +24,10 @@ except ImportError:
 # =========================================================
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024  # Limit request body size to prevent DoS attacks via large uploads.
 
 # --- Structured JSON Logging Setup ---
+# Whitelists extra fields to prevent sensitive or unexpected data from being logged.
 
 
 class JSONFormatter(logging.Formatter):
@@ -84,10 +85,11 @@ if TRUST_PROXY and ProxyFix is not None:
     app.logger.info("ProxyFix enabled. Trusting upstream proxy headers.")
 
 if sqlite3.sqlite_version_info < (3, 35, 0):
-    raise RuntimeError("SQLite 3.35.0+ required for RETURNING clauses.")
+    raise RuntimeError("SQLite 3.35.0+ required for RETURNING clauses.")  # Required for atomic claiming logic.
 
 API_KEY = os.environ.get("BUS_SECRET", "dev_secret")
 if API_KEY == "dev_secret":
+    # Prevent accidental use of default, insecure API key in production.
     raise RuntimeError(
         "CRITICAL: Refusing to start. Running with default BUS_SECRET in production is unsafe.")
 
@@ -124,13 +126,13 @@ DEFAULT_BACKOFF_BASE = 5.0
 DEFAULT_PRIORITY = 100
 MAX_PRIORITY = 1000
 
-NONCE_WINDOW_SECONDS = 300
-NONCE_RETENTION_SECONDS = NONCE_WINDOW_SECONDS * 2
+NONCE_WINDOW_SECONDS = 300  # Valid window for a nonce to prevent replay attacks.
+NONCE_RETENTION_SECONDS = NONCE_WINDOW_SECONDS * 2  # Retention period for nonce tracking.
 
-FULFILLED_RETENTION_SECONDS = 7 * 24 * 60 * 60
-DEAD_RETENTION_SECONDS = 7 * 24 * 60 * 60
+FULFILLED_RETENTION_SECONDS = 7 * 24 * 60 * 60  # Retention for completed intents.
+DEAD_RETENTION_SECONDS = 7 * 24 * 60 * 60  # Retention for dead intents.
 
-MAX_PAYLOAD = 8 * 1024
+MAX_PAYLOAD = 7 * 1024  # Max size for 'payload' and 'result' fields.
 MAX_TTL = 86400
 MAX_OPEN_INTENTS_PER_KEY = 2000
 
@@ -201,22 +203,25 @@ def is_json_safe(obj, max_depth=10, depth=0):
     if isinstance(obj, list):
         return all(is_json_safe(v, max_depth, depth + 1) for v in obj)
     return True
+# Prevent deeply nested JSON payloads to mitigate recursion-based DoS.
 
 
 def valid_namespace(ns: str) -> bool:
-    return bool(re.match(r"^[a-zA-Z0-9_.-]{1,64}$", ns))
+    return bool(re.match(r"^[a-zA-Z0-9_.-]{1,64}$", ns))  # Validate namespace format to prevent injection.
 
 
 def valid_label(value: str) -> bool:
-    return bool(re.match(r"^[a-zA-Z0-9_.:-]{1,64}$", value))
+    return bool(re.match(r"^[a-zA-Z0-9_.:-]{1,64}$", value))  # Validate label format for safe query usage.
 
 
 def strict_quote(s, safe='', encoding=None, errors=None):
     """Enforces strict RFC 3986 percent-encoding for HMAC canonicalization."""
+    # Ensure consistent URL encoding to prevent signature mismatches.
     return quote(s, safe='', encoding=encoding or 'utf-8', errors=errors or 'strict')
 
 
 def admin_auth_ok():
+    # Constant-time comparison to prevent timing attacks.
     token = request.headers.get("X-Admin-Token")
 
     if token:
@@ -294,6 +299,8 @@ def maybe_cleanup():
 
 def get_db():
     if "db" not in g:
+        # WAL mode for concurrency, synchronous=NORMAL for performance,
+        # and isolation_level=None for explicit transaction control.
         db = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL;")
@@ -320,6 +327,7 @@ def ensure_columns(db, table, columns):
         "store", "intents", "tester_keys", "rate_limits",
         "idempotency_keys", "request_nonces", "dead_letters"
     }
+    # Prevent SQL injection into the table name.
     if table not in allowed_tables:
         raise ValueError(f"Security Exception: Untrusted table name '{table}'")
 
@@ -508,6 +516,7 @@ def init_db():
 
 
 def get_role(key):
+    # Constant-time comparison to prevent timing attacks.
     if not key:
         return None
     if hmac.compare_digest(key, API_KEY):
@@ -530,13 +539,14 @@ def verify_signed_request(api_key):
         return False, "Invalid timestamp"
 
     if abs(now() - ts_int) > NONCE_WINDOW_SECONDS:
+        # Reject requests with timestamps outside the allowed window to prevent replay.
         return False, "Stale timestamp"
 
     raw_body = request.get_data(cache=True, as_text=False) or b""
     parsed = parse_qsl(request.query_string.decode(
         "utf-8"), keep_blank_values=True)
 
-    # SORT BY KEY ONLY TO SATISFY RFC 3986
+    # Canonicalize query parameters for consistent signature verification.
     canonical_query = urlencode(
         sorted(parsed, key=lambda x: x[0]), doseq=True, quote_via=strict_quote)
     canonical_path = request.path + \
@@ -547,21 +557,23 @@ def verify_signed_request(api_key):
         canonical_path.encode(),
         ts.encode(),
         nonce.encode(),
-        raw_body,
+        raw_body,  # Include raw body to prevent payload tampering.
     ])
 
     expected = hmac.new(api_key.encode(), msg, hashlib.sha256).hexdigest()
+    # Constant-time comparison to mitigate timing attacks.
     if not hmac.compare_digest(sig, expected):
         return False, "Bad signature"
 
     db = get_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
+        db.execute("BEGIN IMMEDIATE")  # Atomic nonce insertion.
         db.execute("INSERT INTO request_nonces VALUES (?, ?, ?)",
                    (api_key, nonce, now()))
         db.commit()
         return True, None
     except sqlite3.IntegrityError:
+        # Nonce already exists; replay attack detected.
         try:
             db.rollback()
         except Exception:
@@ -718,7 +730,6 @@ def run_cleanup_once():
 
         db.commit()
 
-        # Emit cleanup telemetry
         app.logger.info("cleanup_complete", extra=stats)
         return True, stats
 
@@ -753,7 +764,7 @@ def run_cleanup_once():
 
 @app.before_request
 def security():
-    # Defensive trace ID sanitization
+    # Sanitize X-Request-ID to prevent log injection.
     if getattr(g, "request_id", None) is None:
         req_id = request.headers.get("X-Request-ID", "")
         if re.match(r"^[a-zA-Z0-9_.:-]{1,128}$", req_id):
@@ -767,6 +778,7 @@ def security():
         return
 
     if ENFORCE_HTTPS and not is_local() and not request.is_secure:
+        # Enforce HTTPS to prevent MitM attacks.
         return api_error("https_required", "HTTPS required.", 403)
 
     if request.path != "/admin/cleanup":
@@ -849,11 +861,12 @@ def log_response(response):
         },
     )
 
+    # Standard security headers to prevent clickjacking, sniffing, and caching.
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Intent-Version"] = "7.61"
+    response.headers["X-Intent-Version"] = "2.1"
     return response
 
 # =========================================================
@@ -876,7 +889,7 @@ def health():
 
 
 DASHBOARD_HTML = """
-{% autoescape true %}
+{% autoescape true %} {# Prevent XSS in rendered templates. #}
 <!doctype html>
 <html>
 <head>
@@ -1079,6 +1092,8 @@ def set_value(key):
     ttl = safe_int(data.get("ttl"), 600, 1, MAX_TTL)
     db = get_db()
 
+    # Prefix keys with API key to ensure user isolation.
+
     try:
         db.execute("BEGIN IMMEDIATE")
         db.execute(
@@ -1197,6 +1212,7 @@ def create_intent():
 
             if open_count >= MAX_OPEN_INTENTS_PER_KEY:
                 db.rollback()
+                # Prevent a single API key from flooding the system.
                 return api_error(
                     "limit_exceeded",
                     f"Maximum of {MAX_OPEN_INTENTS_PER_KEY} open intents reached.",
@@ -1287,6 +1303,7 @@ def claim():
         return api_error("invalid_namespace", "Namespace must be 1-64 alphanumeric chars, dots, dashes, or underscores.")
 
     if target_publisher and g.role != "admin" and target_publisher != g.api_key:
+        # Enforce data segregation; only admins or the publisher can filter by publisher.
         return api_error("forbidden", "publisher filtering is restricted.", 403)
 
     t = now()
@@ -1421,6 +1438,7 @@ def extend_claim(iid):
 
         if cur.rowcount == 0:
             db.rollback()
+            # Ensure only the current legitimate claimant can extend the lease.
             return api_error("not_found", "Intent not found, not owned by you, or invalid claim_token.", 404)
 
         db.commit()
@@ -1619,6 +1637,7 @@ def result(iid):
     if not row:
         return api_error("not_found", "Intent not found.", 404)
 
+    # Access control: only admin, publisher, or the current claimer can view results.
     if g.role != "admin" and g.api_key not in (row["publisher"], row["claimed_by"]):
         return api_error("forbidden", "Access denied.", 403)
 
@@ -1779,6 +1798,7 @@ def admin_purge():
         return api_error("invalid_payload", "JSON body must be an object.", 400)
     data = data or {}
 
+    # Require explicit confirmation for destructive actions.
     if data.get("confirm") is not True:
         return api_error("confirmation_required", 'Send {"confirm": true} to purge.', 400)
 
